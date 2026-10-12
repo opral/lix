@@ -130,9 +130,7 @@ where
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 

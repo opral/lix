@@ -1671,9 +1671,7 @@ fn update_workload(shape: FixtureShape, rows: &[WorkloadRow]) -> UpdateWorkload 
             "LIX_TRACKED_STATE_CRUD_PROFILE_SCALAR_UPDATE_ROW_COUNT must be between 1 and {}, got {scalar_rows}",
             rows.len()
         );
-        UpdateWorkload::Transaction(
-            rows[..scalar_rows].iter().map(update_row_sql).collect(),
-        )
+        UpdateWorkload::Transaction(rows[..scalar_rows].iter().map(update_row_sql).collect())
     } else {
         UpdateWorkload::PreparedDml(prepared_update_rows(rows))
     }

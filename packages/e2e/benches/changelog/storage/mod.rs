@@ -60,9 +60,7 @@ impl Storage for ChangelogScoreStorage {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         match self {
             Self::Unit(storage) => storage.acquire_session().await,
             Self::RocksDB { storage, .. } => storage.acquire_session().await,

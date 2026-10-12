@@ -150,10 +150,7 @@ export type WorkerOperation =
 			sql: string;
 			params: BindingParam[];
 			options?: BindingReadOptions;
-			readSnapshotId?: number;
 	  }
-	| { kind: "readSnapshot.open" }
-	| { kind: "readSnapshot.close"; readSnapshotId: number }
 	| { kind: "beginTransaction" }
 	| {
 			kind: "transaction.execute";
@@ -213,7 +210,6 @@ export type WorkerOperation =
 			sql: string;
 			params: BindingParam[];
 			options?: BindingReadOptions;
-			readSnapshotId?: number;
 	  }
 	| { kind: "stream.next"; streamId: number }
 	| { kind: "stream.close"; streamId: number }
@@ -262,7 +258,6 @@ export type WorkerInput = WorkerRequest | WorkerNotification;
 export function isReleaseOperation(operation: WorkerOperation): boolean {
 	return (
 		operation.kind === "stream.close" ||
-		operation.kind === "readSnapshot.close" ||
 		operation.kind === "exportSnapshot.cancel"
 	);
 }

@@ -255,7 +255,7 @@ export async function query<TRow extends object>(
 	const native = nativeParams("query", context.receiver, params);
 	const bindingOptions = readOptions("query", context.receiver, options);
 	throwIfAborted(options.signal);
-	// The caller's signal and the owner's (closing the snapshot or Lix, or
+	// The caller's signal and the owner's (closing the Lix, or
 	// aborting the transaction): either cancels the read with its reason.
 	const signal = readSignal(context, options.signal);
 	const result = await withAbort(
@@ -277,7 +277,7 @@ export async function queryOne<TRow extends object>(
 	// At most two rows are read, so no byte cap applies.
 	const bindingOptions = { single: true };
 	throwIfAborted(options.signal);
-	// The caller's signal and the owner's (closing the snapshot or Lix, or
+	// The caller's signal and the owner's (closing the Lix, or
 	// aborting the transaction): either cancels the read with its reason.
 	const signal = readSignal(context, options.signal);
 	const result = await withAbort(
@@ -323,7 +323,7 @@ export async function stream<TRow extends object>(
 }
 
 /**
- * The open streams or snapshots of an owner, held weakly: an owner closes
+ * The open streams of an owner, held weakly: an owner closes
  * what is still open when it closes, but never keeps an abandoned one alive,
  * so the abandoned one's finalizer can release its engine state.
  */
@@ -356,9 +356,6 @@ export class WeakCollection<T extends object> {
 		return items;
 	}
 
-	get size(): number {
-		return this.#refs.size;
-	}
 }
 
 // An abandoned, unexhausted stream still pins its read state; release it.
@@ -384,7 +381,6 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 	#failure: { error: unknown } | undefined;
 	#closePromise: Promise<void> | undefined;
 	#onClose = new Set<() => void>();
-	#owner: object | undefined;
 	#ended!: () => void;
 	readonly #endedSignal = new Promise<typeof ENDED>((resolve) => {
 		this.#ended = () => resolve(ENDED);
@@ -406,15 +402,6 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 		};
 		if (signal?.aborted) this.#abort();
 		else signal?.addEventListener("abort", this.#abort, { once: true });
-	}
-
-	/**
-	 * @internal Keeps `owner` alive while the stream is open: a snapshot
-	 * that is only reachable through its stream must not be finalized (and
-	 * closed) under it.
-	 */
-	retain(owner: object): void {
-		if (!this.#done) this.#owner = owner;
 	}
 
 	/** @internal Runs `listener` once when the stream ends or closes. */
@@ -545,7 +532,6 @@ export class LixRowStream<TRow extends object> implements RowStream<TRow> {
 	#finish(): void {
 		if (this.#done) return;
 		this.#done = true;
-		this.#owner = undefined;
 		this.#ended();
 		streamFinalizer.unregister(this);
 		this.signal?.removeEventListener("abort", this.#abort);

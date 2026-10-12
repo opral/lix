@@ -12,7 +12,6 @@ import type {
 	LixTransactionBinding,
 	ObserveEventsBinding,
 	QueryStreamBinding,
-	ReadSnapshotBinding,
 	SnapshotExportBinding,
 } from "../binding-types.js";
 import type {
@@ -92,12 +91,6 @@ export function startWorkerHost(
 	const readCancellations = new Map<number, AbortController>();
 	/** The cancellation signal of read request `id`, if it is one. */
 	const readSignal = (id: number) => readCancellations.get(id)?.signal;
-	let nextReadSnapshotId = 1;
-	// Read snapshots belong to one session too; closing it closes them.
-	const readSnapshots = new Map<
-		number,
-		{ binding: ReadSnapshotBinding; sessionId: number }
-	>();
 	const snapshotInputs = new Map<
 		number,
 		{
@@ -467,35 +460,6 @@ export function startWorkerHost(
 				const exportId = message.operation.exportId;
 				void trackDirect(message, () => handleSnapshotCancel(exportId));
 			}
-			return;
-		}
-		if (message.operation.kind === "readSnapshot.close") {
-			const readSnapshotId = message.operation.readSnapshotId;
-			void trackDirect(message, () => handleReadSnapshotClose(readSnapshotId));
-			return;
-		}
-		if (
-			(message.operation.kind === "query" ||
-				message.operation.kind === "stream") &&
-			message.operation.readSnapshotId !== undefined
-		) {
-			// Reads of a pinned state run on the snapshot's own lane: they
-			// never wait behind the session's writes, and a slow read is not
-			// fatal.
-			const operation = message.operation;
-			const readSnapshotId = operation.readSnapshotId!;
-			void scheduleLaneRequest(
-				message,
-				`readSnapshot:${readSnapshotId}`,
-				undefined,
-				() =>
-					handleReadSnapshotRead(
-						message.sessionId,
-						readSnapshotId,
-						operation,
-						readSignal(message.id),
-					),
-			);
 			return;
 		}
 		if (message.operation.kind === "stream") {
@@ -890,18 +854,6 @@ export function startWorkerHost(
 					operation.options,
 					readSignal(requestId),
 				);
-			case "readSnapshot.open": {
-				const binding = await requiredLix(sessionId).snapshot();
-				if (!isSessionLive(sessionId)) {
-					await binding.close().catch(() => undefined);
-					throw workerStateError("Lix session is closing");
-				}
-				const readSnapshotId = nextReadSnapshotId++;
-				readSnapshots.set(readSnapshotId, { binding, sessionId });
-				return readSnapshotId;
-			}
-			case "readSnapshot.close":
-				throw workerStateError("snapshot close bypasses the finite operation queue");
 			case "beginTransaction": {
 				const binding = await requiredLix(sessionId).beginTransaction();
 				const transactionId = nextTransactionId++;
@@ -1053,7 +1005,6 @@ export function startWorkerHost(
 					}
 					await closeObservationsForSession(sessionId);
 					await cancelQueryStreams(sessionId);
-					await closeReadSnapshots(sessionId);
 					await openLix.close();
 					sessions.delete(sessionId);
 					sessionLifetimes.delete(sessionId);
@@ -1126,61 +1077,6 @@ export function startWorkerHost(
 		const stream = queryStreams.get(streamId);
 		queryStreams.delete(streamId);
 		if (stream) await stream.binding.cancel();
-	}
-
-	async function handleReadSnapshotRead(
-		sessionId: number,
-		readSnapshotId: number,
-		operation: Extract<WorkerOperation, { kind: "query" | "stream" }>,
-		signal: AbortSignal | undefined,
-	): Promise<unknown> {
-		const snapshot = readSnapshots.get(readSnapshotId);
-		if (!snapshot || snapshot.sessionId !== sessionId) {
-			const error = workerStateError("the snapshot is closed");
-			error.code = "LIX_ERROR_SNAPSHOT_CLOSED";
-			throw error;
-		}
-		if (operation.kind === "query")
-			return snapshot.binding.query(
-				operation.sql,
-				operation.params,
-				operation.options,
-				signal,
-			);
-		return registerQueryStream(
-			sessionId,
-			await snapshot.binding.stream(
-				operation.sql,
-				operation.params,
-				operation.options,
-				signal,
-			),
-		);
-	}
-
-	/** Resolves once the snapshot's in-flight reads have released its state. */
-	async function handleReadSnapshotClose(readSnapshotId: number): Promise<void> {
-		const snapshot = readSnapshots.get(readSnapshotId);
-		readSnapshots.delete(readSnapshotId);
-		if (snapshot) await snapshot.binding.close();
-	}
-
-	/** Closes the read snapshots of one session, or of every session. */
-	async function closeReadSnapshots(sessionId?: number): Promise<void> {
-		const closed: Promise<void>[] = [];
-		const lanes = new Set<string>();
-		for (const [readSnapshotId, snapshot] of readSnapshots) {
-			if (sessionId !== undefined && snapshot.sessionId !== sessionId) continue;
-			readSnapshots.delete(readSnapshotId);
-			lanes.add(`readSnapshot:${readSnapshotId}`);
-			closed.push(Promise.resolve().then(() => snapshot.binding.close()));
-		}
-		operationScheduler.cancelQueued(
-			schedulerScope,
-			workerStateError("Lix session is closing"),
-			(work) => lanes.has(work.lane),
-		);
-		await Promise.allSettled(closed);
 	}
 
 	/** Cancels the streams of one session, or of every session. */
@@ -1327,7 +1223,6 @@ export function startWorkerHost(
           }
           snapshotExports.clear();
           await capture(() => cancelQueryStreams());
-          await capture(() => closeReadSnapshots());
           await capture(() => operationScheduler.drainScope(schedulerScope));
 		  await Promise.allSettled([
 		    ...registrations,

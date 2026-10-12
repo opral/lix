@@ -79,18 +79,6 @@ macro_rules! wasm_session_methods {
                 .await
             }
 
-            /// Pins the current state for several reads.
-            #[wasm_bindgen(js_name = snapshot)]
-            pub async fn snapshot(&self) -> Result<crate::wasm::WasmReadSnapshot, JsValue> {
-                let snapshot = self
-                    .instrument_operation(crate::session::SessionOperations::read_snapshot(
-                        &self.inner,
-                    ))
-                    .await
-                    .map_err(crate::wasm::lix_error_to_js)?;
-                Ok(crate::wasm::WasmReadSnapshot::new(snapshot))
-            }
-
             /// Runs one statement once per parameter set, atomically.
             #[wasm_bindgen(js_name = executeMany)]
             pub async fn execute_many(

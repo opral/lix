@@ -5273,10 +5273,8 @@ impl UniqueConstraintValue {
 fn stable_typed_constraint_value(value: &lix_schema::Value) -> Option<String> {
     Some(match value {
         lix_schema::Value::Null => "null".to_string(),
-        lix_schema::Value::Text(value) => debug_quoted_str(value),
-        lix_schema::Value::Uuid(value) => {
-            debug_quoted_str(value.hyphenated().encode_lower(&mut uuid::Uuid::encode_buffer()))
-        }
+        lix_schema::Value::Text(value) => format!("{value:?}"),
+        lix_schema::Value::Uuid(value) => format!("{:?}", value.to_string()),
         lix_schema::Value::Int8(value) | lix_schema::Value::Timestamptz(value) => value.to_string(),
         lix_schema::Value::Float8(value) => serde_json::Number::from_f64(*value)?.to_string(),
         lix_schema::Value::Boolean(value) => value.to_string(),
@@ -5284,30 +5282,9 @@ fn stable_typed_constraint_value(value: &lix_schema::Value) -> Option<String> {
     })
 }
 
-/// Exactly `format!("{value:?}")` for a string.
-///
-/// `str`'s `Debug` emits printable ASCII other than `"` and `\` verbatim
-/// between quotes; only other characters need its escaping rules. Constraint
-/// keys are encoded once per staged row, so the common identifier-like value
-/// skips the formatting machinery.
-fn debug_quoted_str(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| matches!(byte, b' '..=b'~') && byte != b'"' && byte != b'\\')
-    {
-        let mut quoted = String::with_capacity(value.len() + 2);
-        quoted.push('"');
-        quoted.push_str(value);
-        quoted.push('"');
-        quoted
-    } else {
-        format!("{value:?}")
-    }
-}
-
 fn stable_unique_value(value: &JsonValue) -> String {
     match value {
-        JsonValue::String(value) => debug_quoted_str(value),
+        JsonValue::String(value) => format!("{value:?}"),
         JsonValue::Number(value) => value.to_string(),
         JsonValue::Bool(value) => value.to_string(),
         JsonValue::Null => "null".to_string(),
@@ -9570,7 +9547,7 @@ mod tests {
 
     #[test]
     fn validated_constraint_rows_match_last_live_identity_map() {
-        let (_, plan) = crate::catalog::CatalogSnapshot::builtin()
+        let (_, plan) = CatalogSnapshot::builtin()
             .plan_for_key("lix_key_value")
             .unwrap();
         let row = |key: &str, branch: &str, tombstone: bool| {
@@ -9685,49 +9662,6 @@ mod tests {
                     ),
                 }
             }
-        }
-    }
-
-    #[test]
-    fn constraint_string_encoding_matches_debug_formatting() {
-        let mut samples = vec![
-            String::new(),
-            "section1.key_42".to_string(),
-            "with space ~ and punctuation !#$%&()*+,-./:;<=>?@[]^_`{|}".to_string(),
-            "quote \" inside".to_string(),
-            "back\\slash".to_string(),
-            "tab\tnewline\ncarriage\r".to_string(),
-            "nul\0byte".to_string(),
-            "del\u{7f}".to_string(),
-            "\u{301}combining first".to_string(),
-            "combining later a\u{301}".to_string(),
-            "ünïcødé ✓ 🎉".to_string(),
-            "\u{200b}zero width".to_string(),
-            "\u{feff}bom".to_string(),
-            "single ' quote".to_string(),
-        ];
-        samples.extend((0u8..=127).map(|byte| char::from(byte).to_string()));
-        samples.extend((0u8..=127).map(|byte| format!("a{}b", char::from(byte))));
-        for sample in &samples {
-            assert_eq!(debug_quoted_str(sample), format!("{sample:?}"), "{sample:?}");
-            assert_eq!(
-                stable_typed_constraint_value(&lix_schema::Value::Text(sample.clone())),
-                Some(format!("{sample:?}"))
-            );
-            assert_eq!(
-                stable_unique_value(&JsonValue::String(sample.clone())),
-                format!("{sample:?}")
-            );
-        }
-        for uuid in [
-            uuid::Uuid::nil(),
-            uuid::Uuid::max(),
-            uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210),
-        ] {
-            assert_eq!(
-                stable_typed_constraint_value(&lix_schema::Value::Uuid(uuid)),
-                Some(format!("{:?}", uuid.to_string()))
-            );
         }
     }
 

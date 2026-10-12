@@ -416,69 +416,6 @@ pub(super) fn rows_affected_to_js(rows_affected: u64) -> Result<JsValue, JsValue
     })
 }
 
-/// A pinned read state: every query and stream through it sees the same
-/// state. `close()` stops its streams and resolves once in-flight reads have
-/// released the state.
-#[wasm_bindgen]
-pub struct WasmReadSnapshot {
-    inner: lix::internal::Snapshot,
-}
-
-impl WasmReadSnapshot {
-    pub(crate) fn new(inner: lix::internal::Snapshot) -> Self {
-        Self { inner }
-    }
-}
-
-#[wasm_bindgen]
-impl WasmReadSnapshot {
-    #[wasm_bindgen(js_name = query)]
-    pub async fn query(
-        &self,
-        sql: String,
-        params: JsValue,
-        options: Option<JsValue>,
-        signal: Option<JsValue>,
-    ) -> Result<JsValue, JsValue> {
-        abortable(signal, async {
-            let params = values_from_js(params)?;
-            let options = read_options_from_js(options)?;
-            let result = crate::session::run_query(self.inner.query(&sql).params(params), options)
-                .await
-                .map_err(lix_error_to_js)?;
-            execute_result_to_js(result)
-        })
-        .await
-    }
-
-    #[wasm_bindgen(js_name = stream)]
-    pub async fn stream(
-        &self,
-        sql: String,
-        params: JsValue,
-        options: Option<JsValue>,
-        signal: Option<JsValue>,
-    ) -> Result<WasmQueryStream, JsValue> {
-        abortable(signal, async {
-            let params = values_from_js(params)?;
-            let max_bytes = read_max_bytes_from_js(options)?;
-            let mut query = self.inner.query(&sql).params(params);
-            if let Some(max_bytes) = max_bytes {
-                query = query.max_bytes(max_bytes);
-            }
-            Ok(WasmQueryStream::new(
-                query.stream().await.map_err(lix_error_to_js)?,
-            ))
-        })
-        .await
-    }
-
-    #[wasm_bindgen(js_name = close)]
-    pub async fn close(&self) -> Result<(), JsValue> {
-        self.inner.close().await.map_err(lix_error_to_js)
-    }
-}
-
 enum WasmSnapshotInputMessage {
     Chunk(Vec<u8>),
     Done,

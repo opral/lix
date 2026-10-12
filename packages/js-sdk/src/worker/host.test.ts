@@ -2031,9 +2031,7 @@ test("pulls of open streams never wait behind long reads in the independent pool
 	const binding = {
 		setTelemetryParent() {},
 		close: vi.fn(async () => {}),
-		async snapshot() {
-			return { query: () => longReads.promise, stream: vi.fn(), close: async () => {} };
-		},
+		query: () => longReads.promise,
 		async stream() {
 			return { columns: ["n"], next: async () => page, cancel: async () => {} };
 		},
@@ -2063,15 +2061,11 @@ test("pulls of open streams never wait behind long reads in the independent pool
 	await vi.waitFor(() =>
 		expect(responses).toContainEqual(expect.objectContaining({ id: 2, ok: true })),
 	);
-	receive({ id: 3, sessionId: 0, operation: { kind: "readSnapshot.open" } });
-	await vi.waitFor(() =>
-		expect(responses).toContainEqual(expect.objectContaining({ id: 3, ok: true })),
-	);
-	// A long snapshot read fills the only independent slot.
+	// A long read fills the only independent slot.
 	receive({
 		id: 4,
 		sessionId: 0,
-		operation: { kind: "query", sql: "SELECT long", params: [], readSnapshotId: 1 },
+		operation: { kind: "query", sql: "SELECT long", params: [] },
 	});
 	await vi.waitFor(() => expect(responses).toContainEqual({ kind: "request.started", id: 4 }));
 	receive({ id: 5, sessionId: 0, operation: { kind: "stream.next", streamId: 1 } });

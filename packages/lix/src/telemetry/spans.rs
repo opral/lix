@@ -173,24 +173,6 @@ define_production_spans! {
             "otel.name",
         ]
     }
-    SQL_COHERENT_READ_BATCH {
-        name: "lix.sql.coherent_read_batch",
-        class: Sql,
-        kind: Client,
-        otel_kind: "client",
-        target: "lix_sql",
-        attributes: [
-            "db.system.name",
-            "db.operation.batch.size",
-            "lix.execution.kind",
-            "db.operation.name",
-            "db.query.summary",
-            "db.query.text",
-            "lix.sql.fingerprint",
-            "lix.sql.query_text_truncated",
-            "otel.name",
-        ]
-    }
     CHECKPOINT_CREATE {
         name: "lix.checkpoint.create",
         class: Lifecycle,
@@ -240,7 +222,6 @@ pub const PRODUCTION_NAMES: &[&str] = &[
     REPOSITORY_OPENED.name,
     SQL_QUERY.name,
     SQL_BATCH.name,
-    SQL_COHERENT_READ_BATCH.name,
     CHECKPOINT_CREATE.name,
     TRANSACTION_WAIT.name,
     TRANSACTION_MATERIALIZE.name,

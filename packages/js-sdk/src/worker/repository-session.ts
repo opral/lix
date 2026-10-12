@@ -42,7 +42,6 @@ export class RepositorySession {
 	private transactions = new Map<number, number>();
 	private exports = new Map<number, number>();
 	private queryStreams = new Map<number, number>();
-	private readSnapshots = new Map<number, number>();
 	private callbacks = new Map<number, number>();
 	private callbackIds = new Map<number, number>();
 	private requests = new Map<number, WorkerRequest>();
@@ -75,7 +74,6 @@ export class RepositorySession {
 		this.transactions.clear();
 		this.exports.clear();
 		this.queryStreams.clear();
-		this.readSnapshots.clear();
 		const replay: WorkerRequest[] = [];
 		const closingObservations = new Set(
 			Array.from(this.requests.values()).flatMap((request) =>
@@ -134,7 +132,6 @@ export class RepositorySession {
 				this.output({ id: request.id, ok: true });
 			} else if (
 				kind === "stream.close" ||
-				kind === "readSnapshot.close" ||
 				kind === "exportSnapshot.cancel"
 			) {
 				// The lost owner took the released state with it.
@@ -351,20 +348,6 @@ export class RepositorySession {
 					);
 				operation.exportId = remote;
 			}
-			if ("readSnapshotId" in operation && operation.readSnapshotId !== undefined) {
-				const remote = this.readSnapshots.get(operation.readSnapshotId);
-				if (remote === undefined) {
-					if (operation.kind === "readSnapshot.close") {
-						this.output({ id: message.id, ok: true, value: undefined });
-						return;
-					}
-					throw repositoryError(
-						"LIX_ERROR_SNAPSHOT_CLOSED",
-						"Read snapshot belonged to a previous repository owner; open a new snapshot",
-					);
-				}
-				operation.readSnapshotId = remote;
-			}
 			if ("streamId" in operation) {
 				const remote = this.queryStreams.get(operation.streamId);
 				if (remote === undefined) {
@@ -574,11 +557,6 @@ export class RepositorySession {
 				this.queryStreams.set(streamId, opened.streamId);
 				value = { ...opened, streamId };
 			}
-		} else if (operation.kind === "readSnapshot.open") {
-			value = this.nextResource++;
-			this.readSnapshots.set(value as number, message.value as number);
-		} else if (operation.kind === "readSnapshot.close") {
-			this.readSnapshots.delete(operation.readSnapshotId);
 		} else if (operation.kind === "stream.next") {
 			if (value == null) this.queryStreams.delete(operation.streamId);
 		} else if (operation.kind === "close")

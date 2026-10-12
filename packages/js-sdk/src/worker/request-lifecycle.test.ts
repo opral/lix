@@ -30,14 +30,12 @@ test("opening and closing have finite budgets; observation waits remain long-liv
 		operationDeadline({ kind: "observe.next", observeId: 1 }),
 	).toBeUndefined();
 });
-test("stream and snapshot reads have no fatal deadline and never report an unknown write outcome", () => {
+test("stream and transaction reads have no fatal deadline and never report an unknown write outcome", () => {
 	const reads = [
 		{ kind: "stream", sql: "SELECT 1", params: [] },
 		{ kind: "stream.next", streamId: 1 },
 		{ kind: "stream.close", streamId: 1 },
-		{ kind: "readSnapshot.open" },
-		{ kind: "readSnapshot.close", readSnapshotId: 1 },
-		{ kind: "query", sql: "SELECT 1", params: [], readSnapshotId: 1 },
+		{ kind: "query", sql: "SELECT 1", params: [] },
 		{ kind: "transaction.stream", transactionId: 1, sql: "SELECT 1", params: [] },
 	] as const;
 	const error = new Error("owner died");

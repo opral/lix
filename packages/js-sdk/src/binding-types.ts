@@ -77,7 +77,7 @@ export type QueryStreamBinding = {
 };
 
 /**
- * Reads of one state: the latest state per call, a snapshot, or a
+ * Reads of one state: the latest state per call or a
  * transaction. Aborting `signal` cancels the read in the engine: its work
  * stops within a time slice and the call rejects with the signal's reason.
  */
@@ -95,12 +95,6 @@ export type ReaderBinding = {
 		options?: BindingReadOptions,
 		signal?: AbortSignal,
 	): Promise<QueryStreamBinding>;
-};
-
-/** A pinned read state. `close()` stops its streams and resolves once
- * in-flight reads have released the state. */
-export type ReadSnapshotBinding = ReaderBinding & {
-	close(): Promise<void>;
 };
 
 export type SnapshotExportBinding = {
@@ -136,7 +130,6 @@ export type LixBinding = ReaderBinding & {
 		options?: BindingExecuteOptions,
 	): Promise<{ rowsAffected: number }>;
 	/** Pins the current state for several reads. */
-	snapshot(): Promise<ReadSnapshotBinding>;
 	observe(
 		sql: string,
 		params: BindingParam[],

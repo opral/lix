@@ -21,7 +21,6 @@ import type {
 	LixTransactionBinding,
 	ObserveEventsBinding,
 	QueryStreamBinding,
-	ReadSnapshotBinding,
 	TelemetryParentContext,
 } from "../binding-types.js";
 import type {
@@ -517,11 +516,6 @@ export function workerBinding(
 					signal,
 				),
 			),
-		snapshot: async () =>
-			workerReadSnapshotBinding(
-				request,
-				await request<number>({ kind: "readSnapshot.open" }),
-			),
 		execute: (sql, params, options) =>
 			request({ kind: "execute", sql, params, options }),
 		executeMany: (sql, paramSets, options) =>
@@ -634,39 +628,6 @@ function workerQueryStreamBinding(
 			finished = true;
 			await request({ kind: "stream.close", streamId });
 		},
-	};
-}
-
-function workerReadSnapshotBinding(
-	request: RequestWorker,
-	readSnapshotId: number,
-): ReadSnapshotBinding {
-	return {
-		query: (sql, params, options, signal) =>
-			request(
-				{ kind: "query", sql, params, options, readSnapshotId },
-				undefined,
-				signal,
-			),
-		stream: async (sql, params, options, signal) =>
-			workerQueryStreamBinding(
-				request,
-				await request<WorkerStreamOpened>(
-					{
-						kind: "stream",
-						sql,
-						params,
-						options,
-						readSnapshotId,
-					},
-					undefined,
-					signal,
-				),
-			),
-		close: () =>
-			request({ kind: "readSnapshot.close", readSnapshotId }).then(
-				() => undefined,
-			),
 	};
 }
 

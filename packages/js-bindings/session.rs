@@ -103,8 +103,6 @@ pub(crate) trait SessionOperations: Sized {
         params: &[Value],
         max_bytes: Option<usize>,
     ) -> Result<lix::RowStream, LixError>;
-    /// Pins the current state for several reads.
-    async fn read_snapshot(&self) -> Result<lix::internal::Snapshot, LixError>;
     async fn close(&self) -> Result<(), LixError>;
     /// Runs any single statement.
     async fn execute(
@@ -227,10 +225,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
         with_query_limit(Lix::query(self, sql).params(params), max_bytes)
             .stream()
             .await
-    }
-
-    async fn read_snapshot(&self) -> Result<lix::internal::Snapshot, LixError> {
-        lix::internal::open_read_snapshot(self).await
     }
 
     async fn close(&self) -> Result<(), LixError> {
@@ -587,10 +581,6 @@ mod remote {
             // Remote reads run behind the protocol's buffered execute; a
             // stream would need a server-held snapshot spanning requests.
             Err(unsupported_remote("stream"))
-        }
-
-        async fn read_snapshot(&self) -> Result<lix::internal::Snapshot, LixError> {
-            Err(unsupported_remote("snapshot"))
         }
 
         async fn close(&self) -> Result<(), LixError> {

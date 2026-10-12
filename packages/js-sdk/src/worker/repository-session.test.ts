@@ -43,7 +43,6 @@ function fixture() {
 										"observe",
 										"beginTransaction",
 										"exportSnapshot",
-										"readSnapshot.open",
 									].includes(message.operation.kind)
 								? resource++
 								: undefined,
@@ -453,32 +452,6 @@ test("query streams map to the owner's id and do not survive owner loss", async 
 	});
 	const cancel = f.request({ kind: "stream.close", streamId });
 	expect(f.result(cancel)).toMatchObject({ ok: true });
-});
-
-test("read snapshots map to the owner's id and do not survive owner loss", async () => {
-	const f = fixture();
-	await f.open();
-	const open = f.request({ kind: "readSnapshot.open" });
-	await tick();
-	const readSnapshotId = f.result(open).value as number;
-	f.request({ kind: "query", sql: "SELECT 1", params: [], readSnapshotId });
-	await tick();
-	expect((f.sent.at(-1) as WorkerRequest).operation).toEqual({
-		kind: "query",
-		sql: "SELECT 1",
-		params: [],
-		readSnapshotId: 10,
-	});
-	f.session.lost();
-	f.session.connected();
-	await tick();
-	const stale = f.request({ kind: "query", sql: "SELECT 1", params: [], readSnapshotId });
-	expect(f.result(stale)).toMatchObject({
-		ok: false,
-		error: { code: "LIX_ERROR_SNAPSHOT_CLOSED" },
-	});
-	const close = f.request({ kind: "readSnapshot.close", readSnapshotId });
-	expect(f.result(close)).toMatchObject({ ok: true });
 });
 
 test("releases are admitted when the pending budget is full", async () => {

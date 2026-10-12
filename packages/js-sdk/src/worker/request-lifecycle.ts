@@ -16,8 +16,6 @@ const commitPolicy = {
 	execute: true,
 	executeMany: true,
 	query: false,
-	"readSnapshot.open": false,
-	"readSnapshot.close": false,
 	beginTransaction: false,
 	"transaction.execute": false,
 	"transaction.executeMany": false,
@@ -60,14 +58,12 @@ export function operationDeadline(
 	if (operation.kind === "observe.next") return undefined;
 	// Reads have no fatal deadline: a slow aggregate or a slow page is not a
 	// hung worker. They are cancellable instead (`request.cancel`,
-	// `stream.close`, `readSnapshot.close`), and the engine yields so the
+	// `stream.close`), and the engine yields so the
 	// worker keeps receiving those messages while a read runs.
 	if (
 		isCancellableRead(operation) ||
 		operation.kind === "stream.next" ||
-		operation.kind === "stream.close" ||
-		operation.kind === "readSnapshot.open" ||
-		operation.kind === "readSnapshot.close"
+		operation.kind === "stream.close"
 	)
 		return undefined;
 	if (operation.kind === "close") return 5_000;

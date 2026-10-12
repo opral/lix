@@ -224,9 +224,6 @@ function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 			if (property === "query" || property === "stream") {
 				return Reflect.get(cancellableReader(target), property);
 			}
-			if (property === "snapshot") {
-				return async () => cancellableReader(await target.snapshot());
-			}
 			if (property === "beginTransaction") {
 				return async () => cancellableReader(await target.beginTransaction());
 			}

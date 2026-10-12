@@ -3930,13 +3930,13 @@ async fn scan_packed_current_base_rows(
     Ok(rows.finish())
 }
 
-/// Provenance-only scan for authenticated packed current-state bases.
-///
-/// The compact identity/value plane already carries the owning commit ID.
-/// Loading each payload-bearing commit member again would add one point-read
-/// request and decoded change record per live row even though destructive
-/// reachability needs no payload. Preserve the normal winner rule while
-/// decoding each packed segment once and materializing only fixed provenance.
+// Provenance-only scan for authenticated packed current-state bases.
+//
+// The compact identity/value plane already carries the owning commit ID.
+// Loading each payload-bearing commit member again would add one point-read
+// request and decoded change record per live row even though destructive
+// reachability needs no payload. Preserve the normal winner rule while
+// decoding each packed segment once and materializing only fixed provenance.
 #[cfg(test)]
 thread_local! {
     static PACKED_IDENTITY_ROWS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

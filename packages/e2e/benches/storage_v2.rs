@@ -192,9 +192,7 @@ impl StorageBenchStorage for InMemoryBenchStorage {
     }
 
     fn fork_for_write(&self, storage: &Self::Storage) -> Self::Storage {
-        storage
-            .fork()
-            .expect("fork in-memory bench storage")
+        storage.fork().expect("fork in-memory bench storage")
     }
 }
 
@@ -1596,9 +1594,7 @@ impl Storage for CountingStorage {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         Err(StorageError::Unsupported(
             lix::storage::Capability::StorageSessions,
         ))
