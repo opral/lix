@@ -39,7 +39,7 @@ jobs:
     name: ${{ inputs.artifacts_only && 'Artifacts only - not release validation' || github.event.pull_request.draft && 'Draft - full CI deferred' || 'Release ready' }}
     if: always() && inputs.artifacts_only != true && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs: [merge-reuse, promote-browser-sdk, promote-server-image, content-browser-sdk, changelog, cargo-config, cargo, js-sdk-test, preview-artifact-changes, preview-server-image]
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -64,7 +64,7 @@ jobs:
   merge-reuse:
     name: Reuse tested merge
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -109,7 +109,7 @@ jobs:
     name: Reuse tested browser SDK
     needs: merge-reuse
     if: needs.merge-reuse.outputs.reuse == 'true'
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       actions: read
@@ -190,7 +190,7 @@ jobs:
     name: Reuse tested server image
     needs: merge-reuse
     if: needs.merge-reuse.outputs.reuse == 'true' && needs.merge-reuse.outputs.server_artifact == 'true'
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read
@@ -225,7 +225,7 @@ jobs:
     name: Changelog
     needs: merge-reuse
     if: inputs.artifacts_only != true && needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     outputs:
       rust: ${{ needs.merge-reuse.outputs.content_only == 'true' && 'false' || steps.scope.outputs.rust }}
 
@@ -285,7 +285,7 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: ubicloud-standard-2-ubuntu-2404
+            runner: ubuntu-24.04
           - name: macOS arm64
             runner: macos-15
           - name: Windows x64
@@ -820,7 +820,7 @@ jobs:
     name: Select preview artifacts
     if: (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'push' || inputs.artifacts_only == true
     needs: merge-reuse
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     outputs:
       server: ${{ steps.changes.outputs.server }}
 
@@ -962,7 +962,7 @@ jobs:
     name: Reuse unchanged content SDK
     needs: merge-reuse
     if: needs.merge-reuse.outputs.content_only == 'true' && needs.merge-reuse.outputs.reuse != 'true'
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
