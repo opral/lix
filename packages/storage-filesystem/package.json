@@ -1,7 +1,7 @@
 {
 	"name": "@lix-js/storage-filesystem",
 	"type": "module",
-	"version": "0.19.0",
+	"version": "0.20.0",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -28,7 +28,7 @@
 		"prepare:native-package": "node ./scripts/prepare-native-package.js"
 	},
 	"peerDependencies": {
-		"@lix-js/sdk": "0.19.0"
+		"@lix-js/sdk": "0.20.0"
 	},
 	"devDependencies": {
 		"@types/node": "^24.10.2",
@@ -36,9 +36,9 @@
 		"vitest": "4.1.10"
 	},
 	"optionalDependencies": {
-		"@lix-js/storage-filesystem-darwin-arm64": "0.19.0",
-		"@lix-js/storage-filesystem-linux-arm64": "0.19.0",
-		"@lix-js/storage-filesystem-linux-x64": "0.19.0",
-		"@lix-js/storage-filesystem-win32-x64": "0.19.0"
+		"@lix-js/storage-filesystem-darwin-arm64": "0.20.0",
+		"@lix-js/storage-filesystem-linux-arm64": "0.20.0",
+		"@lix-js/storage-filesystem-linux-x64": "0.20.0",
+		"@lix-js/storage-filesystem-win32-x64": "0.20.0"
 	}
 }
