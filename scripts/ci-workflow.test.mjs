@@ -100,10 +100,10 @@ test("Cargo output directories match the workspace caches and timing uploads", (
 	);
 });
 
-test("short Linux support jobs use small Ubicloud runners", () => {
-	assert.match(workflow, /name: Changelog[\s\S]*?runs-on: ubicloud-standard-2-ubuntu-2404/);
+test("short Linux support jobs use GitHub-hosted runners", () => {
+	assert.match(workflow, /name: Changelog[\s\S]*?runs-on: ubuntu-24.04/);
 	for (const [name, runner] of [
-		["Linux x64", "ubicloud-standard-2-ubuntu-2404"],
+		["Linux x64", "ubuntu-24.04"],
 		["macOS arm64", "macos-15"],
 		["Windows x64", "windows-2025"],
 	]) {

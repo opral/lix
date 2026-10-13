@@ -29,7 +29,7 @@ env:
 jobs:
   release-version:
     name: Validate release version
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -380,6 +380,10 @@ jobs:
           shared-key: publish-js-sdk-${{ matrix.suffix }}
 
       - name: Restore compiler cache
+        # sccache's Windows server repeatedly exited during the v0.20 build,
+        # triggering fallback compilation until the job timed out.
+        # Keep Cargo's artifact cache, and compile this target directly.
+        if: matrix.suffix != 'win32-x64'
         uses: ./.github/actions/compiler-cache
         with:
           scope: sdk-release-${{ matrix.suffix }}
@@ -529,7 +533,7 @@ jobs:
 
   build-js-sdk:
     name: Assemble @lix-js/sdk
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs: [release-version, build-js-sdk-browser]
     steps:
@@ -885,7 +889,7 @@ jobs:
 
   create-github-release:
     name: Create GitHub release
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     needs:
       - release-version
       - publish-rust-crates
@@ -955,7 +959,7 @@ jobs:
 
   publish-status:
     name: Publish status
-    runs-on: ubicloud-standard-2-ubuntu-2404
+    runs-on: ubuntu-24.04
     needs:
       - release-version
       - publish-lix-server
