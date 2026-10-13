@@ -380,6 +380,10 @@ jobs:
           shared-key: publish-js-sdk-${{ matrix.suffix }}
 
       - name: Restore compiler cache
+        # sccache's Windows server repeatedly exited during the v0.20 build,
+        # triggering fallback compilation until the job timed out.
+        # Keep Cargo's artifact cache, and compile this target directly.
+        if: matrix.suffix != 'win32-x64'
         uses: ./.github/actions/compiler-cache
         with:
           scope: sdk-release-${{ matrix.suffix }}
