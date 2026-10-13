@@ -44,7 +44,6 @@ export const FILESYSTEM_NATIVE_PACKAGES = [
 	"@lix-js/storage-filesystem-darwin-arm64",
 	"@lix-js/storage-filesystem-linux-arm64",
 	"@lix-js/storage-filesystem-linux-x64",
-	"@lix-js/storage-filesystem-win32-x64",
 ];
 export const PUBLIC_NPM_PACKAGE_PATHS = [
 	"packages/js-sdk",

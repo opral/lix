@@ -457,3 +457,28 @@ test("merge reuse promotes the server image and main builds when the source arti
   assert.match(selector, /PROMOTE_SERVER:/);
   assert.match(selector, /\[ "\$GITHUB_EVENT_NAME" = push \]/);
 });
+
+
+test("filesystem release platforms agree across metadata and publication", async () => {
+  const { nativePlatforms, nativePackageName } = await import("../packages/storage-filesystem/scripts/native-platforms.js");
+  const { FILESYSTEM_NATIVE_PACKAGES } = await import("./release.mjs");
+  const expected = ["linux-x64", "linux-arm64", "darwin-arm64"];
+  assert.deepEqual(nativePlatforms.map(platform => platform.suffix), expected);
+  assert.deepEqual(FILESYSTEM_NATIVE_PACKAGES.toSorted(), expected.map(nativePackageName).toSorted());
+  const packageJson = JSON.parse(readFileSync(resolve(repositoryRoot, "packages/storage-filesystem/package.json"), "utf8"));
+  assert.deepEqual(Object.keys(packageJson.optionalDependencies).sort(), FILESYSTEM_NATIVE_PACKAGES.toSorted());
+  const native = publishWorkflow.split("\n  build-filesystem-native-packages:\n")[1].split("\n  build-js-sdk-browser:\n")[0];
+  assert.doesNotMatch(native, /win32|windows/i);
+  assert.match(publishWorkflow, /for suffix in linux-x64 linux-arm64 darwin-arm64; do/);
+  assert.doesNotMatch(readFileSync(resolve(repositoryRoot, "packages/storage-filesystem/js/native-binding.ts"), "utf8"), /storage-filesystem-win32/);
+});
+
+test("Rust publication caches compilation while retaining package verification", () => {
+  const rust = publishWorkflow.split("\n  publish-rust-crates:\n")[1].split("\n  publish-js-sdk:\n")[0];
+  assert.match(rust, /runs-on: ubicloud-standard-8-ubuntu-2404/);
+  assert.match(rust, /scope: release-rust-crates/);
+  assert.match(rust, /SCCACHE_IDLE_TIMEOUT: 0/);
+  assert.match(rust, /node scripts\/publish-crate\.mjs lix /);
+  const publisher = readFileSync(resolve(repositoryRoot, "scripts/publish-crate.mjs"), "utf8");
+  assert.match(publisher, /\["package", "--locked", "-p", crateName\]/);
+});

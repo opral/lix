@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.1 - 2026-10-13
+
+### Patch
+
+- Fixed upgrades of older repositories that failed while verifying historical commits. Indexed rows, branches, and existing data are preserved.
+- Prebuilt filesystem storage packages are available for Linux x64, Linux ARM64, and macOS ARM64. Windows x64 packages are no longer released. Browser and in-memory SDK use on Windows remains supported.
+
 ## 0.20.0 — 2026-10-13
 
 ### Improvements

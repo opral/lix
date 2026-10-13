@@ -348,8 +348,6 @@ jobs:
             runner: ubicloud-standard-30-ubuntu-2404
           - suffix: darwin-arm64
             runner: blacksmith-12vcpu-macos-15
-          - suffix: win32-x64
-            runner: blacksmith-16vcpu-windows-2025
 
     steps:
       - name: Checkout repository
@@ -366,24 +364,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y llvm-dev libclang-dev clang mold
 
-      - name: Install LLVM build dependencies (Windows)
-        if: matrix.suffix == 'win32-x64'
-        shell: pwsh
-        run: |
-          choco install llvm --no-progress -y
-          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: publish-js-sdk-${{ matrix.suffix }}
 
       - name: Restore compiler cache
-        # sccache's Windows server repeatedly exited during the v0.20 build,
-        # triggering fallback compilation until the job timed out.
-        # Keep Cargo's artifact cache, and compile this target directly.
-        if: matrix.suffix != 'win32-x64'
         uses: ./.github/actions/compiler-cache
         with:
           scope: sdk-release-${{ matrix.suffix }}
@@ -698,7 +684,9 @@ jobs:
 
   publish-rust-crates:
     name: Publish crates.io packages
-    runs-on: ubicloud-standard-30-ubuntu-2404
+    runs-on: ubicloud-standard-8-ubuntu-2404
+    env:
+      SCCACHE_IDLE_TIMEOUT: 0
     environment: production
     # All reversible build and test work must succeed before the first
     # immutable registry upload. Registry publication is then serialized:
@@ -734,6 +722,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: publish-rust-crates
+
+      - name: Restore compiler cache
+        uses: ./.github/actions/compiler-cache
+        with:
+          scope: release-rust-crates
 
       - name: Preflight all lockstep Rust crates
         run: |
@@ -874,7 +867,7 @@ jobs:
             npm publish "$pack_path" --provenance --access public
           }
 
-          for suffix in linux-x64 linux-arm64 darwin-arm64 win32-x64; do
+          for suffix in linux-x64 linux-arm64 darwin-arm64; do
             package_dir="$GITHUB_WORKSPACE/native-packages/filesystem-native-$suffix"
             if [ ! -f "$package_dir/package.json" ]; then
               echo "Missing native package artifact for $suffix." >&2
