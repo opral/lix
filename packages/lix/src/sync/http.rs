@@ -907,6 +907,26 @@ where
         Ok((renewed, deadline))
     }
 
+    /// A new operation uses the latest authenticated expiry, not the durable
+    /// opening receipt's expiry. Existing operation/replay identities stay fixed.
+    pub(crate) fn read_operation_expiry(
+        &self,
+        request: &super::read_fulfillment::ReadFulfillmentRequest,
+    ) -> Result<u64, LixError> {
+        let lease = self.baseline_lease.lock().clone().ok_or_else(|| {
+            LixError::new(
+                super::SYNC_PROTOCOL_MISMATCH_CODE,
+                "read operation requires a bound baseline lease",
+            )
+        })?;
+        // Renewal may extend validity, never change repository/account/roots.
+        lease.validate_for_roots(
+            &self.active_account_id,
+            &super::leased_descriptor::descriptor_roots(&request.descriptor)?,
+        )?;
+        Ok(lease.expires_at_ms)
+    }
+
     fn require_bound_native_lease(&self) -> Result<(), LixError> {
         if self.baseline_lease.lock().is_none() {
             return Err(LixError::new(

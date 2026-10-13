@@ -1483,6 +1483,7 @@ where
     C: super::super::http::RawHttpClient + Clone + 'static,
 {
     let mut attempt_request = request.clone();
+    attempt_request.operation_expires_at_ms = transport.read_operation_expiry(request)?;
     let mut network_retry_used = false;
     let mut operation_restart_used = false;
     let mut reusable_permit = Some(initial_owner.1);
@@ -1524,6 +1525,9 @@ where
                 // terminal cleanup capability, so discard the older unpolled
                 // duplicate without sending a release request.
                 retry_remote_cleanup.take();
+                if operation_restart_used {
+                    tracing::info!(operation = "read_fulfillment", recovery_stage = "recovered", "read operation recovered after restart");
+                }
                 return Ok(stage);
             }
             Err(mut failure)
@@ -1575,8 +1579,14 @@ where
                 }
                 drop(retry_remote_cleanup.take());
                 reusable_permit = failure.permit.take().or_else(|| reusable_permit.take());
+                // Restart creates a new identity with fresh authenticated validity.
+                // Network retries above keep the original identity and expiry.
+                transport.renew_native_baseline_lease().await?;
+                attempt_request.operation_expires_at_ms = transport.read_operation_expiry(request)?;
+                attempt_request.continuation = None;
                 attempt_request.operation_id = uuid::Uuid::now_v7().to_string();
                 next_owner_id = uuid::Uuid::now_v7();
+                tracing::info!(operation = "read_fulfillment", recovery_stage = "operation_restarted", "renewed authenticated baseline for bounded read recovery");
                 operation_restart_used = true;
             }
             Err(mut failure) => {
