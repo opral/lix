@@ -250,7 +250,6 @@ const nativePackages = {
 	"linux-x64": "@lix-js/storage-filesystem-linux-x64",
 	"linux-arm64": "@lix-js/storage-filesystem-linux-arm64",
 	"darwin-arm64": "@lix-js/storage-filesystem-darwin-arm64",
-	"win32-x64": "@lix-js/storage-filesystem-win32-x64",
 } as const;
 
 function resolveNativePath() {
