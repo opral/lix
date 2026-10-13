@@ -308,3 +308,38 @@ test("WASM child sessions route SQL telemetry independently and nested sessions 
   expect(childSpans).toEqual([]);
  } finally { await nested.close(); await child.close(); await root.close(); }
 });
+
+test("upgrades the published format-81 snapshot without losing indexed data", async () => {
+	const { openLix } = await import("@lix-js/sdk");
+	const response = await fetch(
+		new URL(
+			"../../lix/tests/fixtures/migration/released-v017-format81.lix",
+			import.meta.url,
+		),
+	);
+	expect(response.ok).toBe(true);
+	const lix = await openLix.fromSnapshot(response.body!);
+	try {
+		expect(
+			await lix.query("SELECT id,label FROM legacy_index ORDER BY id"),
+		).toEqual([
+			{ id: "global", label: "kept-global" },
+			{ id: "local", label: "kept-local" },
+		]);
+		expect(
+			await lix.query(
+				"SELECT id FROM lix_branch WHERE name = 'historical-fork'",
+			),
+		).toHaveLength(1);
+		await lix.execute(
+			"UPDATE legacy_index SET label = 'after-upgrade' WHERE id = 'local'",
+		);
+		expect(
+			await lix.query(
+				"SELECT id FROM legacy_index WHERE label = 'after-upgrade'",
+			),
+		).toEqual([{ id: "local" }]);
+	} finally {
+		await lix.close();
+	}
+}, 30_000);
