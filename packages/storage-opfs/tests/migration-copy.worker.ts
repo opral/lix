@@ -60,6 +60,35 @@ self.onmessage = async () => {
 		} catch {
 			nonemptyRejected = true;
 		}
+		const rollbackTarget = await OpfsBackend.open(
+			`migration-rollback:${crypto.randomUUID()}`,
+		);
+		let copyFailureRolledBack = false;
+		try {
+			const invalidWrite = await source.beginWrite({
+				awaitDurable: true,
+				preconditions: [],
+				batchCapacityHintBytes: 70 * 1024,
+			});
+			await invalidWrite.putMany(
+				{
+					id: 1003,
+					name: "invalid-legacy-key",
+					valueSemantics: "mutable",
+					valueIntegrity: "backendVerified",
+				},
+				[{ key: new Uint8Array(65537), value: new Uint8Array([1]) }],
+			);
+			await invalidWrite.commit();
+			try {
+				await source.copyForMigration(rollbackTarget);
+			} catch (error) {
+				if (!String(error).includes("bounded transfer limits")) throw error;
+				copyFailureRolledBack = rollbackTarget.isEmptyForMigration();
+			}
+		} finally {
+			await rollbackTarget.close();
+		}
 		self.postMessage({
 			before,
 			copied,
@@ -67,6 +96,7 @@ self.onmessage = async () => {
 			after,
 			nonemptyRejected,
 			largeBytes,
+			copyFailureRolledBack,
 		});
 	} catch (error) {
 		self.postMessage({ error: String(error) });

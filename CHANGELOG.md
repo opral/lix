@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.20.1 - 2026-10-13
+
+### Patch
+
+- Fixed upgrades of older repositories that failed while verifying historical commits. Indexed rows, branches, and existing data are preserved.
+- Prebuilt filesystem storage packages are available for Linux x64, Linux ARM64, and macOS ARM64. Windows x64 packages are no longer released. Browser and in-memory SDK use on Windows remains supported.
+
+## 0.20.0 — 2026-10-13
+
+### Improvements
+
+- New SQL APIs: `query()` and `queryOne()` for reads, `stream()` for large local reads, and `executeMany()` for bulk writes. Use transactions for atomic writes and consistent reads across several statements.
+- Faster file opening and synchronization in large repositories, with lower memory use and more responsive reads while synchronization is running.
+- SQL supports file checksums with `encode(sha256(content), 'hex')`, plus `UPDATE` and `DELETE` predicates containing subqueries.
+
+### Fixes
+
+- More reliable repository upgrades and reopening, preserving stored data, offline access, and pending local edits.
+- Improved recovery from interrupted synchronization, cancelled requests, and closed browser tabs. Closing or deleting a repository no longer blocks unrelated requests.
+- Fixed filesystem deletion crashes and compilation failures in Rust applications installing Lix without an existing lockfile.
+
+### Upgrade notes
+
+- JavaScript reads return plain object rows. Replace `executeBatch()` with `lix.transaction()`; `rowMode` is removed. Bind JSON parameters explicitly with `json(value)` or `Value.jsonb(value)`.
+- Buffered results are limited to 64 MiB by default. Use `stream()` for large local reads or adjust `maxBytes`. Transaction, file-content, and partial-replica streams still buffer under that limit; remote handles use `query()` rather than `stream()`.
+- Rust queries and writes use builders such as `lix.query(sql).params(params).all().await`.
+- Upgrade clients and servers together. Supported older repositories upgrade during opening without resetting their data. Custom storage providers must implement the updated read contract.
+
+See the [JavaScript API](docs/js-api-reference.md), [Rust quickstart](docs/rust-quickstart.md), and [migration guide](docs/partial-replica-migration.md) for details.
+
 ## 0.19.0 — 2026-10-06
 
 ### Improvements

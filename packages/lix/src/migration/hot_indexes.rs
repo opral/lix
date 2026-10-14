@@ -127,7 +127,9 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let _started = migration_profile_start!();
-    let read = super::MigrationPlanningRead::new(adapter).await?;
+    let read = super::MigrationPlanningRead::new(adapter)
+        .await?
+        .with_legacy_commit_records();
     migration_profile_record_duration!(_profile, _started, planning_read);
     // A sparse receipt authenticates only resident ranges. Retire the old
     // derived plane without fabricating collection completeness or hydrating
@@ -330,6 +332,50 @@ where
 mod tests {
     use super::*;
     use crate::storage_adapter::StorageSession;
+
+    #[tokio::test]
+    async fn released_v017_format81_preserves_indexed_rows_and_branches() {
+        let storage = crate::Memory::new();
+        let bytes =
+            include_bytes!("../../tests/fixtures/migration/released-v017-format81.lix").to_vec();
+        let report = crate::migration::restore_and_migrate_repository(
+            storage.clone(),
+            futures_util::io::Cursor::new(bytes),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.before.format, Some(81));
+        assert!(report.semantic_preservation_verified);
+        let lix = crate::open_lix().with_storage(storage).await.unwrap();
+        let rows = lix
+            .query("SELECT id,label FROM legacy_index ORDER BY id")
+            .all()
+            .await
+            .unwrap();
+        assert_eq!(rows.rows().len(), 2);
+        assert_eq!(
+            lix.query("SELECT id FROM lix_branch WHERE name = 'historical-fork'")
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .len(),
+            1
+        );
+        lix.execute("UPDATE legacy_index SET label = 'after-upgrade' WHERE id = 'local'")
+            .await
+            .unwrap();
+        assert_eq!(
+            lix.query("SELECT id FROM legacy_index WHERE label = 'after-upgrade'")
+                .all()
+                .await
+                .unwrap()
+                .rows()
+                .len(),
+            1
+        );
+        lix.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn v81_rebuild_preserves_rows_and_repairs_missing_indexes() {

@@ -8,6 +8,7 @@ use crate::storage_adapter::StorageScanOrder as ScanOrder;
 
 pub(crate) struct MigrationPlanningRead<S> {
     inner: Arc<MigrationReadState<S>>,
+    legacy_commit_records: bool,
 }
 
 struct MigrationReadState<S> {
@@ -20,6 +21,7 @@ impl<S> Clone for MigrationPlanningRead<S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            legacy_commit_records: self.legacy_commit_records,
         }
     }
 }
@@ -27,6 +29,13 @@ impl<S> Clone for MigrationPlanningRead<S> {
 impl<S: Storage + Clone + Send + Sync + 'static> MigrationPlanningRead<S> {
     pub(crate) async fn new(source: &StorageAdapter<S>) -> Result<Self, StorageError> {
         Self::capture(source, false).await
+    }
+
+    /// Read historical roots during migration planning without rewriting the
+    /// source. Ordinary reads and preservation scans retain the original bytes.
+    pub(crate) fn with_legacy_commit_records(mut self) -> Self {
+        self.legacy_commit_records = true;
+        self
     }
 
     /// A competing cold opener may publish its seed while this read-only seed
@@ -49,6 +58,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> MigrationPlanningRead<S> {
                 revision,
                 initialization,
             }),
+            legacy_commit_records: false,
         })
     }
 
@@ -94,7 +104,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> crate::storage_adapter::Storage
         }
         retry_read(|| async {
             let read = self.read().await?;
-            read.get_many(requests).await
+            let mut result = read.get_many(requests).await?;
+            if self.legacy_commit_records {
+                let spaces = requests
+                    .iter()
+                    .flat_map(|request| request.keys.iter().map(move |_| request.space));
+                for (value, space) in result.values.iter_mut().zip(spaces) {
+                    if space == crate::changelog::COMMIT_SPACE
+                        && let Some(value) = value
+                    {
+                        normalize_legacy_commit(value)?;
+                    }
+                }
+            }
+            Ok(result)
         })
         .await
     }
@@ -141,7 +164,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> StorageScanSource for FrozenSca
                 cursor.next_page(limit_rows.min(MAX_SCAN_PAGE_ROWS)).await
             })
             .await?;
-            let (entries, has_more) = page.into_parts();
+            let (mut entries, has_more) = page.into_parts();
+            if self.source.legacy_commit_records && self.space == crate::changelog::COMMIT_SPACE {
+                for entry in &mut entries {
+                    normalize_legacy_commit(&mut entry.value)?;
+                }
+            }
             if let Some(last) = entries.last() {
                 match self.opts.order {
                     ScanOrder::Ascending => self.range.lower = Bound::Excluded(last.key.clone()),
@@ -151,6 +179,17 @@ impl<S: Storage + Clone + Send + Sync + 'static> StorageScanSource for FrozenSca
             Ok(ScanChunk::new(entries, has_more))
         })
     }
+}
+
+fn normalize_legacy_commit(value: &mut ProjectedValue) -> Result<(), StorageError> {
+    if let ProjectedValue::FullValue(bytes) = value
+        && let Some(record) = super::super::checkpoint_metadata::decode_v7(bytes)
+    {
+        *bytes = crate::storage_codec::encode("migration commit", &record)
+            .map_err(|error| StorageError::Io(error.to_string()))?
+            .into();
+    }
+    Ok(())
 }
 
 async fn retry_read<T, F, Fut>(mut operation: F) -> Result<T, StorageError>

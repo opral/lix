@@ -9,6 +9,7 @@ export default defineConfig({
 				fileURLToPath(new URL(".", import.meta.url)),
 				fileURLToPath(new URL("../storage-opfs", import.meta.url)),
 				fileURLToPath(new URL("../lix/tests/fixtures/plugin-api", import.meta.url)),
+				fileURLToPath(new URL("../lix/tests/fixtures/migration", import.meta.url)),
 			],
 		},
 	},

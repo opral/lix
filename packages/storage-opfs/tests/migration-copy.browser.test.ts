@@ -16,6 +16,7 @@ test("detached copy preserves all logical spaces and source bytes under physical
 		expect(result.targetDigest).toBe(result.before);
 		expect(result.after).toBe(result.before);
 		expect(result.nonemptyRejected).toBe(true);
+		expect(result.copyFailureRolledBack).toBe(true);
 		expect(result.largeBytes).toBe(17 * 1024 * 1024);
 	} finally {
 		worker.terminate();

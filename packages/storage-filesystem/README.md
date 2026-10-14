@@ -26,8 +26,10 @@ const lix = await openLix({ storage });
 ```
 
 The JavaScript package supplies the native engine and RocksDB filesystem adapter.
-Its optional platform packages install the matching N-API binary for Linux x64/ARM64,
-macOS ARM64, or Windows x64. Install optional dependencies for filesystem support.
+Its optional platform packages install the matching N-API binary for Linux x64, Linux ARM64,
+and macOS ARM64. Install optional dependencies for filesystem support.
+Prebuilt filesystem packages are no longer released for Windows. Browser and
+in-memory SDK use on Windows remains supported.
 The SDK alone uses WASM and does not install native binaries.
 
 Filesystem SQL and synchronization keep their existing native execution path.

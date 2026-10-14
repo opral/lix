@@ -1,5 +1,0 @@
----
-type: patch
----
-
-Propagate worker HTTP cancellation to the response stream even when queued data has stopped RPC pulls. Aborted streams discard queued chunks and stop requesting more data, preserving the existing timeout-versus-caller-cancellation policy.

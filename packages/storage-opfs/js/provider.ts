@@ -289,17 +289,27 @@ export class OpfsBackend implements LixStorageProvider {
 		) {
 			throw new Error("Migration requires a fresh empty destination");
 		}
-		const digest = await this.#visitMigrationEntries((space, key, value) => {
-			destination.#database.exec({
-				sql: "INSERT INTO lix_entries(space,key,value) VALUES (?,?,?)",
-				bind: [space, key, value],
+		// The unpublished destination is physically owned by this migration.
+		// Commit the copy once instead of flushing an SQLite transaction per row.
+		destination.#database.exec("BEGIN IMMEDIATE");
+		let digest: string;
+		try {
+			digest = await this.#visitMigrationEntries((space, key, value) => {
+				destination.#database.exec({
+					sql: "INSERT INTO lix_entries(space,key,value) VALUES (?,?,?)",
+					bind: [space, key, value],
+				});
 			});
-		});
+			if ((await destination.migrationDigest()) !== digest)
+				throw new Error("Migration copy verification failed");
+			destination.#database.exec("COMMIT");
+		} catch (error) {
+			destination.#database.exec("ROLLBACK");
+			throw error;
+		}
 		destination.#generation += 1;
 		destination.#oldestReadGeneration = destination.#generation;
 		fenceSqliteOpfsDurability(destination.#database);
-		if ((await destination.migrationDigest()) !== digest)
-			throw new Error("Migration copy verification failed");
 		return digest;
 	}
 
