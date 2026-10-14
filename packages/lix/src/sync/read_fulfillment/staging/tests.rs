@@ -1424,6 +1424,7 @@ async fn framed_large_typed_member_validates_before_atomic_payload_and_locator_p
 
 #[derive(Clone)]
 struct ExpiringReadClient {
+    lease: crate::gc::NativeBaselineLease,
     lix_id: String,
     account: String,
     inputs: Vec<ReadInput>,
@@ -1448,6 +1449,8 @@ impl crate::sync::http::RawHttpClient for ExpiringReadClient {
                         "activeAccountId": self.account,
                     }),
                 )
+            } else if raw.url.ends_with("/sync/baseline-lease/renew") {
+                (200, serde_json::to_value(&self.lease).unwrap())
             } else {
                 assert!(raw.url.ends_with("/sync/read-fulfillment"));
                 let request: ReadFulfillmentRequest =
@@ -2215,6 +2218,7 @@ struct TerminalLossState {
 
 #[derive(Clone)]
 struct TerminalLossReadClient {
+    lease: crate::gc::NativeBaselineLease,
     lix_id: String,
     account: String,
     inputs: Vec<ReadInput>,
@@ -2281,6 +2285,13 @@ impl crate::sync::http::RawHttpClient for TerminalLossReadClient {
                         "activeAccountId": client.account,
                     }))
                     .unwrap(),
+                });
+            }
+            if raw.url.ends_with("/sync/baseline-lease/renew") {
+                return Ok(crate::sync::http::RawHttpResponse {
+                    status: 200,
+                    status_text: "renewed".into(),
+                    body: serde_json::to_vec(&client.lease).unwrap(),
                 });
             }
             let request: ReadFulfillmentRequest =
@@ -2372,7 +2383,10 @@ async fn terminal_loss_transport(
         requests: Mutex::new(Vec::new()),
         release_requests: AtomicUsize::new(0),
     });
+    let lease =
+        crate::sync::LeasedPartialReplicaDescriptor::for_test(request.descriptor.clone(), &account);
     let client = TerminalLossReadClient {
+        lease: lease.lease.clone(),
         lix_id: request.descriptor.lix_id.clone(),
         account: account.clone(),
         inputs,
@@ -2384,8 +2398,6 @@ async fn terminal_loss_transport(
     )
     .await
     .unwrap();
-    let lease =
-        crate::sync::LeasedPartialReplicaDescriptor::for_test(request.descriptor.clone(), &account);
     transport.bind_native_baseline_lease(&lease.lease).unwrap();
     (transport, state)
 }
@@ -2563,7 +2575,10 @@ async fn exercise_cursor_restart(repeated: bool) {
     let account = crate::SYSTEM_ACCOUNT_ID.to_owned();
     let attempts = Arc::new(AtomicUsize::new(0));
     let releases = Arc::new(AtomicUsize::new(0));
+    let lease =
+        crate::sync::LeasedPartialReplicaDescriptor::for_test(request.descriptor.clone(), &account);
     let client = ExpiringReadClient {
+        lease: lease.lease.clone(),
         lix_id: request.descriptor.lix_id.clone(),
         account: account.clone(),
         inputs: inputs.clone(),
@@ -2577,8 +2592,6 @@ async fn exercise_cursor_restart(repeated: bool) {
     )
     .await
     .unwrap();
-    let lease =
-        crate::sync::LeasedPartialReplicaDescriptor::for_test(request.descriptor.clone(), &account);
     transport.bind_native_baseline_lease(&lease.lease).unwrap();
     let result = fetch_staged(&storage, &state, &transport, &request).await;
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
@@ -2878,9 +2891,7 @@ async fn held_read_transport(
     )
     .await
     .unwrap();
-    transport
-        .bind_native_baseline_lease(state.baseline_lease())
-        .unwrap();
+    transport.bind_native_baseline_lease(state.baseline_lease()).unwrap();
     transport
 }
 
@@ -3115,9 +3126,7 @@ async fn retry_reservation_failure_transport(
     )
     .await
     .unwrap();
-    transport
-        .bind_native_baseline_lease(state.baseline_lease())
-        .unwrap();
+    transport.bind_native_baseline_lease(state.baseline_lease()).unwrap();
     transport
 }
 
@@ -3673,9 +3682,7 @@ async fn continuation_recovery_transport(
     )
     .await
     .unwrap();
-    transport
-        .bind_native_baseline_lease(state.baseline_lease())
-        .unwrap();
+    transport.bind_native_baseline_lease(state.baseline_lease()).unwrap();
     transport
 }
 
@@ -3821,4 +3828,140 @@ async fn retry_reservation_failure_keeps_process_permit_until_remote_release_ack
         0,
         "process admission is returned only after the release acknowledgment"
     );
+}
+
+#[derive(Clone)]
+struct RenewalReadClient {
+    lix_id: String,
+    lease: crate::gc::NativeBaselineLease,
+    inputs: Vec<ReadInput>,
+    requests: Arc<Mutex<Vec<ReadFulfillmentRequest>>>,
+    renewals: Arc<AtomicUsize>,
+}
+impl crate::sync::http::RawHttpClient for RenewalReadClient {
+    fn send(
+        &self,
+        raw: crate::sync::http::RawHttpRequest,
+    ) -> crate::sync::SyncTransportFuture<'_, crate::sync::http::RawHttpResponse> {
+        Box::pin(async move {
+            let (status, body) = if raw.method == http::Method::GET {
+                (
+                    200,
+                    serde_json::json!({
+                        "protocolVersion": crate::SERVER_PROTOCOL_VERSION,
+                        "syncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
+                        "lixId": self.lix_id, "sessionId": "renewal-test",
+                        "activeAccountId": self.lease.account_id,
+                    }),
+                )
+            } else if raw.url.ends_with("/sync/baseline-lease/renew") {
+                self.renewals.fetch_add(1, Ordering::SeqCst);
+                (200, serde_json::to_value(&self.lease).unwrap())
+            } else {
+                let request: ReadFulfillmentRequest =
+                    serde_json::from_slice(raw.body.as_ref().unwrap()).unwrap();
+                self.requests.lock().unwrap().push(request.clone());
+                if !request.release && request.operation_expires_at_ms < self.lease.expires_at_ms {
+                    (
+                        410,
+                        serde_json::json!({"error": {"code": "LIX_READ_FULFILLMENT_RESTART", "message": "read operation validity expired"}}),
+                    )
+                } else {
+                    let inputs = if request.release {
+                        vec![]
+                    } else {
+                        self.inputs.clone()
+                    };
+                    let response = ReadFulfillmentResponse {
+                        frame: None,
+                        lix_id: request.descriptor.lix_id.clone(),
+                        epoch_id: request.epoch_id.clone(),
+                        request_digest: request.digest().unwrap(),
+                        closure_digest: input_digest(&request, &inputs).unwrap(),
+                        inputs,
+                        profile: Default::default(),
+                        continuation: None,
+                        outcome: ReadFulfillmentOutcome::Complete,
+                    };
+                    (200, serde_json::to_value(response).unwrap())
+                }
+            };
+            Ok(crate::sync::http::RawHttpResponse {
+                status,
+                status_text: "renewal fixture".into(),
+                body: serde_json::to_vec(&body).unwrap(),
+            })
+        })
+    }
+}
+
+async fn exercise_renewed_read(background_renewed: bool) {
+    let (storage, state, mut request) = fixture().await;
+    let inputs = vec![chunk(98, 1024)];
+    request = lifecycle_request(request, &inputs);
+    let mut prior = state.baseline_lease().clone();
+    prior.expires_at_ms = crate::telemetry::unix_time_ms() + 60_000;
+    request.operation_expires_at_ms = prior.expires_at_ms;
+    let mut renewed = prior.clone();
+    renewed.expires_at_ms += 60_000;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let renewals = Arc::new(AtomicUsize::new(0));
+    let client = RenewalReadClient {
+        lix_id: state.repository_id().into(),
+        lease: renewed.clone(),
+        inputs: inputs.clone(),
+        requests: requests.clone(),
+        renewals: renewals.clone(),
+    };
+    let transport = crate::sync::http::HttpSyncTransport::connect_with(client, state.remote_id())
+        .await
+        .unwrap();
+    transport.bind_native_baseline_lease(&prior).unwrap();
+    if background_renewed {
+        transport.renew_native_baseline_lease().await.unwrap();
+    }
+    let mut stage = fetch_staged(&storage, &state, &transport, &request)
+        .await
+        .unwrap();
+    stage.promote(&request, false).await.unwrap();
+    let reads: Vec<_> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| !request.release)
+        .cloned()
+        .collect();
+    assert_eq!(renewals.load(Ordering::SeqCst), 1);
+    assert_eq!(reads.len(), if background_renewed { 1 } else { 2 });
+    assert_eq!(
+        reads.last().unwrap().operation_expires_at_ms,
+        renewed.expires_at_ms
+    );
+    assert_eq!(reads[0].operation_id, request.operation_id);
+    if !background_renewed {
+        assert_ne!(reads[1].operation_id, reads[0].operation_id);
+    }
+    assert_eq!(
+        state.baseline_lease().expires_at_ms,
+        u64::MAX,
+        "durable receipt need not be rewritten to use authenticated renewal"
+    );
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let ReadInputAddress::BlobChunk(hash) = &inputs[0].address else {
+        panic!("fixture must request a chunk");
+    };
+    let recovered = crate::binary_cas::load_verified_chunk(
+        &read,
+        crate::binary_cas::ChunkHash::from_bytes(*hash),
+    ).await.unwrap().unwrap();
+    assert_eq!(recovered, inputs[0].bytes);
+
+}
+#[tokio::test]
+async fn new_read_uses_authenticated_background_renewal_instead_of_receipt_expiry() {
+    exercise_renewed_read(true).await;
+}
+#[tokio::test]
+async fn expired_operation_renews_once_and_recovers_exact_content() {
+    exercise_renewed_read(false).await;
 }
